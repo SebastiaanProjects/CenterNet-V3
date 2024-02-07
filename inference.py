@@ -3,8 +3,10 @@ import numpy as np
 import torch
 from torchvision import transforms
 from model.centernet import CenterNet
+#import CenterNet
 import matplotlib.pyplot as plt
 from pprint import pprint
+from torch import nn
 
 
 def preprocess_img(img, input_ksize):

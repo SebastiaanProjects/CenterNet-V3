@@ -1,6 +1,6 @@
 import torch
 import torch.nn.functional as F
-from loss.utils import gather_feature
+from utils import gather_feature
 
 
 def bbox_overlaps_diou(bboxes1, bboxes2):

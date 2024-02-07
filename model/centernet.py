@@ -1,12 +1,143 @@
-from .backbone.renset import ResNet
-from model.decoder import Decoder
-from model.head import Head
-from model.fpn import FPN
-from loss.utils import map2coords
+#from backbone.renset import ResNet
+#from decoder import Decoder
+#from head import Head
+#from fpn import FPN
+#from loss.utils import map2coords
 import torch
 from torch import nn
 import torch.nn.functional as F
 
+
+
+Norm = nn.BatchNorm2d
+
+
+class Conv1x1(nn.Module):
+    def __init__(self, num_in, num_out):
+        super().__init__()
+        self.conv = nn.Conv2d(num_in, num_out, kernel_size=1, bias=False)
+        self.norm = Norm(num_out)
+        self.active = nn.ReLU(True)
+        self.block = nn.Sequential(self.conv, self.norm, self.active)
+
+    def forward(self, x):
+        return self.block(x)
+
+
+class Conv3x3(nn.Module):
+    def __init__(self, num_in, num_out):
+        super().__init__()
+        self.conv = nn.Conv2d(num_in, num_out, kernel_size=3, padding=1,
+                              bias=False)
+        self.norm = Norm(num_out)
+        self.active = nn.ReLU(True)
+        self.block = nn.Sequential(self.conv, self.norm, self.active)
+
+    def forward(self, x):
+        return self.block(x)
+
+
+class FPN(nn.Module):
+    def __init__(self, inplanes, outplanes=512):
+        super(FPN, self).__init__()
+
+        self.laterals = nn.Sequential(*[Conv1x1(inplanes // (2 ** c), outplanes) for c in range(4)])
+        self.smooths = nn.Sequential(*[Conv3x3(outplanes * c, outplanes * c) for c in range(1, 5)])
+        self.pooling = nn.MaxPool2d(2)
+
+    def forward(self, features):
+        laterals = [l(features[f]) for f, l in enumerate(self.laterals)]
+
+        map4 = laterals[3]
+        map3 = laterals[2] + nn.functional.interpolate(map4, scale_factor=2,
+                                                       mode="nearest")
+        map2 = laterals[1] + nn.functional.interpolate(map3, scale_factor=2,
+                                                       mode="nearest")
+        map1 = laterals[0] + nn.functional.interpolate(map2, scale_factor=2,
+                                                       mode="nearest")
+
+        map1 = self.smooth[0](map1)
+        map2 = self.smooth[1](torch.cat([map2, self.pooling(map1)], dim=1))
+        map3 = self.smooth[2](torch.cat([map3, self.pooling(map2)], dim=1))
+        map4 = self.smooth[3](torch.cat([map4, self.pooling(map3)], dim=1))
+        return map4
+
+
+class Head(nn.Module):
+    def __init__(self, num_classes=80, channel=64):
+        super(Head, self).__init__()
+
+        self.cls_head = nn.Sequential(
+            nn.Conv2d(256, channel,
+                      kernel_size=3, padding=1, bias=True),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(channel, num_classes,
+                      kernel_size=1, stride=1, padding=0))
+        self.wh_head = self.ConvReluConv(256, 2)
+        self.reg_head = self.ConvReluConv(256, 2)
+
+    def ConvReluConv(self, in_channel, out_channel, bias_fill=False, bias_value=0):
+        feat_conv = nn.Conv2d(in_channel, in_channel, kernel_size=3, padding=1)
+        relu = nn.ReLU()
+        out_conv = nn.Conv2d(in_channel, out_channel, kernel_size=1)
+        if bias_fill:
+            out_conv.bias.data.fill_(bias_value)
+        return nn.Sequential(feat_conv, relu, out_conv)
+
+    def forward(self, x):
+        hm = self.cls_head(x).sigmoid()
+        wh = self.wh_head(x).relu()
+        offset = self.reg_head(x)
+        return hm, wh, offset
+
+
+
+class Decoder(nn.Module):
+    def __init__(self, inplanes, bn_momentum=0.1):
+        super(Decoder, self).__init__()
+        self.bn_momentum = bn_momentum
+        # backbone output: [b, 2048, _h, _w]
+        self.inplanes = inplanes
+        self.deconv_with_bias = False
+        self.deconv_layers = self._make_deconv_layer(
+            num_layers=3,
+            num_filters=[256, 256, 256],
+            num_kernels=[4, 4, 4],
+        )
+
+    def _make_deconv_layer(self, num_layers, num_filters, num_kernels):
+        layers = []
+        for i in range(num_layers):
+            kernel = num_kernels[i]
+            padding = 0 if kernel == 2 else 1
+            output_padding = 1 if kernel == 3 else 0
+            planes = num_filters[i]
+            layers.append(
+                nn.ConvTranspose2d(
+                    in_channels=self.inplanes,
+                    out_channels=planes,
+                    kernel_size=kernel,
+                    stride=2,
+                    padding=padding,
+                    output_padding=output_padding,
+                    bias=self.deconv_with_bias))
+            layers.append(nn.BatchNorm2d(planes, momentum=self.bn_momentum))
+            layers.append(nn.ReLU(inplace=True))
+            self.inplanes = planes
+        return nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.deconv_layers(x)
+
+
+def map2coords(h, w, stride):
+    shifts_x = torch.arange(0, w * stride, step=stride, dtype=torch.float32)
+    shifts_y = torch.arange(0, h * stride, step=stride, dtype=torch.float32)
+    shift_y, shift_x = torch.meshgrid(shifts_y, shifts_x)
+    shift_x = shift_x.reshape(-1)
+    shift_y = shift_y.reshape(-1)
+    locations = torch.stack((shift_x, shift_y), dim=1) + stride // 2
+    return locations
 
 def gather_feature(fmap, index, mask=None, use_transform=False):
     if use_transform:
@@ -23,6 +154,89 @@ def gather_feature(fmap, index, mask=None, use_transform=False):
         fmap = fmap[mask]
         fmap = fmap.reshape(-1, dim)
     return fmap
+
+
+def convert_to_inplace_relu(model):
+    for m in model.modules():
+        if isinstance(m, nn.ReLU):
+            m.inplace = True
+
+class ResNet(nn.Module):
+    def __init__(self, slug='r50', pretrained=True):
+        super().__init__()
+        if not pretrained:
+            print("Caution, not loading pretrained weights.")
+
+        if slug == 'r18':
+            self.resnet = models.resnet18(pretrained=pretrained)
+            num_bottleneck_filters = 512
+        elif slug == 'r34':
+            self.resnet = models.resnet34(pretrained=pretrained)
+            num_bottleneck_filters = 512
+        elif slug == 'r50':
+            self.resnet = models.resnet50(pretrained=pretrained)
+            num_bottleneck_filters = 2048
+        elif slug == 'r101':
+            self.resnet = models.resnet101(pretrained=pretrained)
+            num_bottleneck_filters = 2048
+        elif slug == 'r152':
+            self.resnet = models.resnet152(pretrained=pretrained)
+            num_bottleneck_filters = 2048
+        elif slug == 'rx50':
+            self.resnet = models.resnext50_32x4d(pretrained=pretrained)
+            num_bottleneck_filters = 2048
+        elif slug == 'rx101':
+            self.resnet = models.resnext101_32x8d(pretrained=pretrained)
+            num_bottleneck_filters = 2048
+        elif slug == 'r50d':
+            self.resnet = timm.create_model('gluon_resnet50_v1d',
+                                            pretrained=pretrained)
+            convert_to_inplace_relu(self.resnet)
+            num_bottleneck_filters = 2048
+        elif slug == 'r101d':
+            self.resnet = timm.create_model('gluon_resnet101_v1d',
+                                            pretrained=pretrained)
+            convert_to_inplace_relu(self.resnet)
+            num_bottleneck_filters = 2048
+
+        else:
+            assert False, "Bad slug: %s" % slug
+
+        self.outplanes = num_bottleneck_filters
+
+    def forward(self, x):
+        size = x.size()
+        assert size[-1] % 32 == 0 and size[-2] % 32 == 0, \
+            "image resolution has to be divisible by 32 for resnet"
+
+        enc0 = self.resnet.conv1(x)
+        enc0 = self.resnet.bn1(enc0)
+        enc0 = self.resnet.relu(enc0)
+        enc0 = self.resnet.maxpool(enc0)
+
+        enc1 = self.resnet.layer1(enc0)
+        enc2 = self.resnet.layer2(enc1)
+        enc3 = self.resnet.layer3(enc2)
+        enc4 = self.resnet.layer4(enc3)
+
+        return enc1, enc2, enc3, enc4
+
+    def freeze_bn(self):
+        for layer in self.modules():
+            if isinstance(layer, nn.BatchNorm2d):
+                layer.eval()
+
+    def freeze_stages(self, stage):
+        if stage >= 0:
+            self.resnet.bn1.eval()
+            for m in [self.resnet.conv1, self.resnet.bn1]:
+                for param in m.parameters():
+                    param.requires_grad = False
+        for i in range(1, stage + 1):
+            layer = getattr(self.resnet, 'layer{}'.format(i))
+            layer.eval()
+            for param in layer.parameters():
+                param.requires_grad = False
 
 
 class CenterNet(nn.Module):

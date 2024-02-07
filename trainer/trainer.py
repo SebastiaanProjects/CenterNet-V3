@@ -1,9 +1,9 @@
 import os, logging
 import torch
-from trainer.lr_scheduler import *
+#from trainer.lr_scheduler import *
 
 try:
-    import apex
+    import apex #before copyiing trainer.lr_scheduler used to be written in green without the line underneath
     APEX = True
 except:
     APEX = False

@@ -1,7 +1,7 @@
 import torch
 from torch import nn
-from loss.losses import *
-from loss.utils import *
+from losses import *
+from utils import *
 import numpy as np
 
 
@@ -12,7 +12,7 @@ class Loss(nn.Module):
 
         self.focal_loss = modified_focal_loss
         self.iou_loss = DIOULoss
-        self.l1_loss = F.l1_loss
+        self.l1_loss = F.l1_l
 
         self.alpha = cfg.loss_alpha
         self.beta = cfg.loss_beta
